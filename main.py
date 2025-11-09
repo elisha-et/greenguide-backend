@@ -5,12 +5,14 @@ import requests
 from io import BytesIO
 from PIL import Image
 import traceback
+import json
+import random
 from config import settings
 
 app = FastAPI(
     title="GreenGuide API",
     description="AI-powered waste classification and disposal advisor",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -29,7 +31,10 @@ def encode_image_to_base64(image_bytes):
 
 
 def call_vision_model(image_base64):
-    """Call NVIDIA Nemotron vision model to identify the object"""
+    """
+    Call NVIDIA Nemotron vision model to identify and validate the object
+    Returns: dict with is_waste_item, item_name, rejection_reason, confidence
+    """
     headers = {
         "Authorization": f"Bearer {settings.NVIDIA_API_KEY}",
         "Content-Type": "application/json"
@@ -43,7 +48,29 @@ def call_vision_model(image_base64):
                 "content": [
                     {
                         "type": "text",
-                        "text": "Identify this object in one or two words. Only respond with the object name, nothing else."
+                        "text": """You are a waste classification expert. Analyze this image carefully.
+
+First, determine if this is a waste/disposal item that someone would throw away or recycle.
+
+If YES (it's a waste item):
+- Identify the specific item (e.g., 'plastic water bottle', 'banana peel', 'AA battery', 'cotton t-shirt')
+- Be specific about material when possible (e.g., 'aluminum can' not just 'can')
+
+If NO (not a waste item):
+- Determine why: person, animal, landscape, building, multiple_items, unclear, food_on_plate, empty_image
+
+Respond ONLY with JSON in this exact format:
+{
+  "is_waste_item": true or false,
+  "item_name": "specific item name or null",
+  "rejection_reason": "reason code or null",
+  "confidence": 0.0 to 1.0
+}
+
+Examples:
+- Plastic bottle → {"is_waste_item": true, "item_name": "plastic water bottle", "rejection_reason": null, "confidence": 0.95}
+- Person's face → {"is_waste_item": false, "item_name": null, "rejection_reason": "person", "confidence": 0.98}
+- Blurry image → {"is_waste_item": false, "item_name": null, "rejection_reason": "unclear", "confidence": 0.3}"""
                     },
                     {
                         "type": "image_url",
@@ -54,7 +81,7 @@ def call_vision_model(image_base64):
                 ]
             }
         ],
-        "max_tokens": 50,
+        "max_tokens": 150,
         "temperature": 0.2
     }
     
@@ -72,9 +99,29 @@ def call_vision_model(image_base64):
             )
         
         result = response.json()
-        object_name = result["choices"][0]["message"]["content"].strip()
-        print(f"   ✅ Identified: {object_name}")
-        return object_name
+        content = result["choices"][0]["message"]["content"].strip()
+        
+        # Try to parse JSON response
+        try:
+            # Remove markdown code blocks if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            parsed = json.loads(content)
+            print(f"   ✅ Vision result: {parsed}")
+            return parsed
+            
+        except json.JSONDecodeError:
+            # Fallback: try to extract info from text
+            print(f"   ⚠️ Could not parse JSON, using fallback")
+            return {
+                "is_waste_item": True,
+                "item_name": content.lower(),
+                "rejection_reason": None,
+                "confidence": 0.7
+            }
     
     except requests.exceptions.Timeout:
         print("   ❌ Request timed out")
@@ -82,13 +129,16 @@ def call_vision_model(image_base64):
     except requests.exceptions.RequestException as e:
         print(f"   ❌ Request error: {e}")
         raise HTTPException(status_code=500, detail=f"Vision model error: {str(e)}")
-    except (KeyError, IndexError) as e:
-        print(f"   ❌ Response parsing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected response format from vision model")
+    except Exception as e:
+        print(f"   ❌ Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Vision processing error: {str(e)}")
 
 
 def call_reasoning_model(object_name):
-    """Call NVIDIA Llama-Nemotron reasoning model to determine disposal method"""
+    """
+    Call NVIDIA Llama-Nemotron reasoning model to determine disposal category
+    Returns: dict with category, preparation_steps, confidence
+    """
     headers = {
         "Authorization": f"Bearer {settings.NVIDIA_API_KEY}",
         "Content-Type": "application/json"
@@ -98,11 +148,31 @@ def call_reasoning_model(object_name):
         "model": settings.REASONING_MODEL,
         "messages": [
             {
+                "role": "system",
+                "content": """You are a waste management expert. Classify items into these categories:
+
+1. recyclable - Clean paper, cardboard, glass bottles/jars, metal cans, plastic bottles/containers (#1-7)
+2. compostable - Food scraps, fruit/vegetable peels, coffee grounds, yard waste, paper napkins
+3. landfill - Contaminated items, mixed materials, chip bags, styrofoam, used napkins
+4. hazardous - Batteries, paint, chemicals, motor oil, pesticides, fluorescent bulbs
+5. e-waste - Electronics, phones, computers, cables, small appliances, chargers
+6. textile - Clothes, shoes, bags, fabric, towels, bedding
+
+Provide 2-3 brief preparation steps if needed."""
+            },
+            {
                 "role": "user",
-                "content": f"For a {object_name}, should it be recycled, composted, or sent to landfill? Answer with only ONE word: recycle, compost, or landfill."
+                "content": f"""Classify: {object_name}
+
+Respond ONLY with JSON:
+{{
+  "category": "one of: recyclable, compostable, landfill, hazardous, e-waste, textile",
+  "preparation_steps": ["step 1", "step 2"],
+  "confidence": 0.0 to 1.0
+}}"""
             }
         ],
-        "max_tokens": 10,
+        "max_tokens": 200,
         "temperature": 0.1
     }
     
@@ -120,17 +190,48 @@ def call_reasoning_model(object_name):
             )
         
         result = response.json()
-        disposal_method = result["choices"][0]["message"]["content"].strip().lower()
+        content = result["choices"][0]["message"]["content"].strip()
         
-        if "recycle" in disposal_method:
-            disposal_method = "recycle"
-        elif "compost" in disposal_method:
-            disposal_method = "compost"
-        else:
-            disposal_method = "landfill"
-        
-        print(f"   ✅ Disposal method: {disposal_method}")
-        return disposal_method
+        # Parse JSON response
+        try:
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            parsed = json.loads(content)
+            
+            # Validate category
+            valid_categories = ["recyclable", "compostable", "landfill", "hazardous", "e-waste", "textile"]
+            if parsed.get("category") not in valid_categories:
+                # Fallback to landfill if invalid
+                parsed["category"] = "landfill"
+                parsed["confidence"] = 0.5
+            
+            print(f"   ✅ Category: {parsed['category']} (confidence: {parsed.get('confidence', 0.8)})")
+            return parsed
+            
+        except json.JSONDecodeError:
+            # Fallback parsing
+            content_lower = content.lower()
+            category = "landfill"
+            
+            if "recyclable" in content_lower or "recycle" in content_lower:
+                category = "recyclable"
+            elif "compost" in content_lower:
+                category = "compostable"
+            elif "hazardous" in content_lower:
+                category = "hazardous"
+            elif "e-waste" in content_lower or "electronic" in content_lower:
+                category = "e-waste"
+            elif "textile" in content_lower or "fabric" in content_lower:
+                category = "textile"
+            
+            return {
+                "category": category,
+                "preparation_steps": [],
+                "confidence": 0.7
+            }
     
     except requests.exceptions.Timeout:
         print("   ❌ Request timed out")
@@ -138,32 +239,61 @@ def call_reasoning_model(object_name):
     except requests.exceptions.RequestException as e:
         print(f"   ❌ Request error: {e}")
         raise HTTPException(status_code=500, detail=f"Reasoning model error: {str(e)}")
-    except (KeyError, IndexError) as e:
-        print(f"   ❌ Response parsing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected response format from reasoning model")
 
 
-def call_educator_model(object_name, disposal_method):
-    """Call NVIDIA Nemotron educator model to provide environmental impact feedback"""
+def call_educator_model(object_name, category):
+    """
+    Call NVIDIA Nemotron educator model to provide environmental impact feedback
+    Returns: dict with primary_metric and feedback text
+    """
     headers = {
         "Authorization": f"Bearer {settings.NVIDIA_API_KEY}",
         "Content-Type": "application/json"
+    }
+    
+    # Randomly select a primary metric to focus on
+    metric_type = random.choice(settings.IMPACT_METRICS)
+    
+    # Map metric types to better prompts
+    metric_prompts = {
+        "co2_savings": "CO2 emissions prevented",
+        "energy_savings": "energy saved (use relatable comparisons like 'power a laptop for X hours')",
+        "water_conservation": "water conserved (in gallons or liters)",
+        "resource_conservation": "raw materials saved",
+        "landfill_space_saved": "landfill space saved",
+        "pollution_reduction": "pollution prevented"
     }
     
     payload = {
         "model": settings.EDUCATOR_MODEL,
         "messages": [
             {
+                "role": "system",
+                "content": f"""You are an environmental educator. Create engaging, specific feedback about the environmental impact of proper disposal.
+
+Focus on: {metric_prompts[metric_type]}
+
+Requirements:
+1. Start with the primary benefit
+2. Include a SPECIFIC, QUANTIFIED metric (e.g., "saves enough energy to charge your phone 500 times", not just "saves energy")
+3. Add one interesting fact or comparison
+4. Keep it under 3 sentences
+5. Be encouraging and friendly, not preachy
+
+Make the user feel good about their eco-friendly choice!"""
+            },
+            {
                 "role": "user",
-                "content": f"In 2-3 sentences, explain the environmental benefit of choosing to {disposal_method} a {object_name}. Include an estimate of CO2 savings if applicable."
+                "content": f"Item: {object_name}\nDisposal: {category}\n\nProvide environmental impact feedback focusing on {metric_type.replace('_', ' ')}."
             }
         ],
-        "max_tokens": 150,
+        "max_tokens": 200,
         "temperature": 0.7
     }
     
     try:
         print(f"📚 Calling educator model: {settings.EDUCATOR_MODEL}")
+        print(f"   Focus metric: {metric_type}")
         response = requests.post(settings.API_ENDPOINT, headers=headers, json=payload, timeout=60)
         
         print(f"   Status: {response.status_code}")
@@ -177,8 +307,13 @@ def call_educator_model(object_name, disposal_method):
         
         result = response.json()
         feedback = result["choices"][0]["message"]["content"].strip()
+        
         print(f"   ✅ Feedback generated ({len(feedback)} chars)")
-        return feedback
+        
+        return {
+            "primary_metric": metric_type,
+            "feedback": feedback
+        }
     
     except requests.exceptions.Timeout:
         print("   ❌ Request timed out")
@@ -186,9 +321,24 @@ def call_educator_model(object_name, disposal_method):
     except requests.exceptions.RequestException as e:
         print(f"   ❌ Request error: {e}")
         raise HTTPException(status_code=500, detail=f"Educator model error: {str(e)}")
-    except (KeyError, IndexError) as e:
-        print(f"   ❌ Response parsing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected response format from educator model")
+
+
+def get_friendly_rejection_message(rejection_reason):
+    """Return user-friendly message for rejected images"""
+    messages = {
+        "person": "I can help identify waste items! Please take a photo of the item you'd like to dispose of, not people.",
+        "animal": "That's adorable! 🐕 But I specialize in waste classification. Try photographing the item you want to dispose of.",
+        "landscape": "Nice view! But I need a closer photo of a specific item for disposal guidance.",
+        "building": "I see a building, but I need to see the specific item you want to dispose of. Try taking a closer photo.",
+        "unclear": "I couldn't identify that clearly. Try taking a closer, well-lit photo of the item.",
+        "blurry": "The image is too blurry. Please take a clearer photo of the item you'd like to classify.",
+        "food_on_plate": "Is this leftover food? If so, food scraps are typically compostable! Scrape leftovers into a compost bin.",
+        "empty_image": "I don't see an item to classify. Please take a photo of what you'd like to dispose of.",
+        "multiple_items": "I see multiple items! For best results, photograph one item at a time.",
+        "default": "I couldn't identify this as a waste item. Please try taking a clearer photo of a single item you want to dispose of."
+    }
+    
+    return messages.get(rejection_reason, messages["default"])
 
 
 @app.get("/")
@@ -196,12 +346,14 @@ async def root():
     """Health check endpoint"""
     return {
         "status": "GreenGuide API is running",
-        "version": "1.0.0",
-        "models": {
-            "vision": settings.VISION_MODEL,
-            "reasoning": settings.REASONING_MODEL,
-            "educator": settings.EDUCATOR_MODEL
-        }
+        "version": "2.0.0",
+        "features": {
+            "waste_categories": 6,
+            "confidence_scoring": True,
+            "invalid_image_detection": True,
+            "environmental_metrics": len(settings.IMPACT_METRICS)
+        },
+        "categories": list(settings.WASTE_CATEGORIES.keys())
     }
 
 
@@ -211,7 +363,8 @@ async def health_check():
     return {
         "status": "healthy",
         "api_key_configured": settings.validate(),
-        "models_loaded": True
+        "models_loaded": True,
+        "waste_categories": settings.WASTE_CATEGORIES
     }
 
 
@@ -221,7 +374,7 @@ async def classify_waste(file: UploadFile = File(...)):
     Main endpoint: Accepts an image and returns classification, disposal method, and feedback
     """
     print("\n" + "="*60)
-    print("🌱 NEW REQUEST RECEIVED")
+    print("🌱 NEW REQUEST RECEIVED (v2.0)")
     print("="*60)
     
     try:
@@ -234,6 +387,11 @@ async def classify_waste(file: UploadFile = File(...)):
         try:
             image = Image.open(BytesIO(image_bytes))
             print(f"   Format: {image.format}, Dimensions: {image.size}")
+            
+            # Convert to RGB if needed
+            if image.mode not in ('RGB', 'L'):
+                print(f"   Converting from {image.mode} to RGB")
+                image = image.convert('RGB')
             
             # Resize if image is too large
             max_size = (1024, 1024)
@@ -256,36 +414,100 @@ async def classify_waste(file: UploadFile = File(...)):
         # Step 1: Encode image
         print("\n📦 Encoding image to base64...")
         image_base64 = encode_image_to_base64(image_bytes)
-        print(f"   Base64 length: {len(image_base64):,} chars")
         
-        # Step 2: Identify object using vision model
+        # Step 2: Identify and validate object using vision model
         print("\n[1/3] Identifying object...")
-        object_name = call_vision_model(image_base64)
+        vision_result = call_vision_model(image_base64)
         
-        # Step 3: Determine disposal method using reasoning model
-        print("\n[2/3] Determining disposal method...")
-        disposal_method = call_reasoning_model(object_name)
+        # Check if this is a valid waste item
+        if not vision_result.get("is_waste_item", False):
+            rejection_reason = vision_result.get("rejection_reason", "default")
+            friendly_message = get_friendly_rejection_message(rejection_reason)
+            
+            print(f"\n❌ REJECTED: {rejection_reason}")
+            print("="*60 + "\n")
+            
+            result = {
+                "success": False,
+                "is_waste_item": False,
+                "rejection_reason": rejection_reason,
+                "message": friendly_message,
+                "confidence": vision_result.get("confidence", 0.0)
+            }
+        
+            # Print the JSON being sent
+            print(f"\n📤 Sending rejection response:")
+            print(json.dumps(result, indent=2))
+            print("="*60 + "\n")
+            
+            return result
+
+        object_name = vision_result.get("item_name", "unknown item")
+        vision_confidence = vision_result.get("confidence", 0.8)
+        
+        # Step 3: Determine disposal category using reasoning model
+        print("\n[2/3] Determining disposal category...")
+        reasoning_result = call_reasoning_model(object_name)
+        
+        category = reasoning_result.get("category", "landfill")
+        preparation_steps = reasoning_result.get("preparation_steps", [])
+        reasoning_confidence = reasoning_result.get("confidence", 0.8)
         
         # Step 4: Get environmental feedback using educator model
         print("\n[3/3] Generating environmental feedback...")
-        feedback = call_educator_model(object_name, disposal_method)
+        educator_result = call_educator_model(object_name, category)
         
-        # Return all results
+        # Calculate overall confidence (average of vision and reasoning)
+        overall_confidence = (vision_confidence + reasoning_confidence) / 2
+        
+        # Determine confidence level
+        if overall_confidence >= settings.CONFIDENCE_HIGH:
+            confidence_level = "high"
+        elif overall_confidence >= settings.CONFIDENCE_MEDIUM:
+            confidence_level = "medium"
+        else:
+            confidence_level = "low"
+        
+        # Get category metadata
+        category_info = settings.WASTE_CATEGORIES.get(category, {})
+        
+        # Build response
         result = {
             "success": True,
+            "is_waste_item": True,
             "object": object_name,
-            "disposal_method": disposal_method,
-            "environmental_feedback": feedback
+            "category": category,
+            "category_info": {
+                "name": category,
+                "icon": category_info.get("icon", "🗑️"),
+                "color": category_info.get("color", "#FF9500"),
+                "description": category_info.get("description", "")
+            },
+            "preparation_steps": preparation_steps,
+            "confidence": {
+                "score": round(overall_confidence, 2),
+                "level": confidence_level,
+                "vision": round(vision_confidence, 2),
+                "reasoning": round(reasoning_confidence, 2)
+            },
+            "environmental_impact": {
+                "primary_metric": educator_result["primary_metric"],
+                "feedback": educator_result["feedback"]
+            }
         }
         
         print("\n" + "="*60)
         print("✅ REQUEST COMPLETED SUCCESSFULLY")
         print("="*60)
         print(f"Object: {object_name}")
-        print(f"Disposal: {disposal_method}")
-        print(f"Feedback: {feedback[:100]}...")
+        print(f"Category: {category}")
+        print(f"Confidence: {confidence_level} ({overall_confidence:.2f})")
+        print(f"Metric: {educator_result['primary_metric']}")
         print("="*60 + "\n")
         
+        print(f"\n📤 Sending response:")
+        print(json.dumps(result, indent=2))
+
         return result
     
     except HTTPException as he:
@@ -302,12 +524,14 @@ async def classify_waste(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*60)
-    print("🌱 GREENGUIDE BACKEND SERVER")
+    print("🌱 GREENGUIDE BACKEND SERVER v2.0")
     print("="*60)
     print(f"Vision Model: {settings.VISION_MODEL}")
     print(f"Reasoning Model: {settings.REASONING_MODEL}")
     print(f"Educator Model: {settings.EDUCATOR_MODEL}")
     print(f"API Key Configured: {settings.validate()}")
+    print(f"Waste Categories: {len(settings.WASTE_CATEGORIES)}")
+    print(f"Impact Metrics: {len(settings.IMPACT_METRICS)}")
     print("="*60)
     print(f"Server starting on: {settings.HOST}:{settings.PORT}")
     print("="*60 + "\n")
