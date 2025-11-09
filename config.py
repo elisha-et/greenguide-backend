@@ -6,8 +6,7 @@ class Settings:
     
     # Get API key from environment variable, fallback to hardcoded for local dev
     NVIDIA_API_KEY: str = os.getenv(
-        "NVIDIA_API_KEY",
-        "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"
+        "NVIDIA_API_KEY"
     )
     
     # API endpoint
